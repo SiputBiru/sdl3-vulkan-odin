@@ -2,8 +2,8 @@ package main
 
 import "base:runtime"
 import "core:fmt"
-import "core:image"
 import "core:log"
+import "core:os"
 import "core:slice"
 import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
@@ -190,6 +190,12 @@ main :: proc() {
 		return
 	}
 
+	// Create Render Pipeline
+	pipeline, pipeline_layout, pipe_ok := create_graphics_pipeline(device, render_pass)
+	if !pipe_ok {
+		return
+	}
+
 	// Create FrameBuffers
 	framebuffers, fb_ok := create_framebuffers(device, render_pass, &swapchain)
 	if !fb_ok {
@@ -229,6 +235,10 @@ main :: proc() {
 		delete(sync_objects.render_finished_semaphores)
 		delete(sync_objects.image_available_semaphores)
 		delete(sync_objects.in_flight_fences)
+
+		// Destroy Pipeline
+		vk.DestroyPipeline(device, pipeline, nil)
+		vk.DestroyPipelineLayout(device, pipeline_layout, nil)
 
 		// Delete command Buffer
 		delete(command_buffers)
@@ -275,6 +285,7 @@ main :: proc() {
 			render_pass,
 			framebuffers,
 			&current_frame,
+			pipeline,
 		)
 
 	}
@@ -814,6 +825,7 @@ record_command_buffer :: proc(
 	render_pass: vk.RenderPass,
 	framebuffers: []vk.Framebuffer,
 	extent: vk.Extent2D,
+	pipeline: vk.Pipeline,
 ) {
 	// Begin Recording
 	begin_info := vk.CommandBufferBeginInfo {
@@ -842,6 +854,30 @@ record_command_buffer :: proc(
 
 	vk.CmdBeginRenderPass(buffer, &render_pass_info, .INLINE)
 
+	// Bind the pipeline
+	vk.CmdBindPipeline(buffer, .GRAPHICS, pipeline)
+
+	// set dynamic viewport
+	viewport := vk.Viewport {
+		x        = 0.0,
+		y        = 0.0,
+		width    = f32(extent.width),
+		height   = f32(extent.height),
+		minDepth = 0.0,
+		maxDepth = 1.0,
+	}
+	vk.CmdSetViewport(buffer, 0, 1, &viewport)
+
+	// set the scissor
+	scissor := vk.Rect2D {
+		offset = {0.0, 0.0},
+		extent = extent,
+	}
+	vk.CmdSetScissor(buffer, 0, 1, &scissor)
+
+	// Draw Triangle
+	vk.CmdDraw(buffer, 3, 1, 0, 0)
+
 
 	// Drawing commands go here
 	// vk.CmdBindPipeline(...)
@@ -866,6 +902,7 @@ draw_frame :: proc(
 	render_pass: vk.RenderPass,
 	framebuffers: []vk.Framebuffer,
 	current_frame: ^int,
+	pipeline: vk.Pipeline,
 ) {
 	// wait previous frame to finish
 	vk.WaitForFences(device, 1, &sync.in_flight_fences[current_frame^], true, max(u64))
@@ -909,6 +946,7 @@ draw_frame :: proc(
 		render_pass,
 		framebuffers,
 		swapchain.extent,
+		pipeline,
 	)
 
 	// Submit command buffer
@@ -954,4 +992,171 @@ draw_frame :: proc(
 
 	// Advance to the next frame (0 -> 1 -> 0 -> 1...)
 	current_frame^ = (current_frame^ + 1) % MAX_FRAMES_IN_FLIGHT
+}
+
+create_shader_module :: proc(device: vk.Device, filename: string) -> (vk.ShaderModule, bool) {
+	// Read the binary file
+	code, success := os.read_entire_file(filename)
+	if !success {
+		log.errorf("Failed to read shader file: %s", filename)
+		return {}, false
+	}
+	defer delete(code) // Free the file memory after we upload it to Vulkan
+
+	create_info := vk.ShaderModuleCreateInfo {
+		sType    = .SHADER_MODULE_CREATE_INFO,
+		codeSize = len(code),
+		pCode    = cast(^u32)raw_data(code),
+	}
+
+	module: vk.ShaderModule
+	if res := vk.CreateShaderModule(device, &create_info, nil, &module); res != .SUCCESS {
+		log.errorf("Failed to create shader module for %s: %v", filename, res)
+		return {}, false
+	}
+
+	return module, true
+}
+
+
+create_graphics_pipeline :: proc(
+	device: vk.Device,
+	render_pass: vk.RenderPass,
+) -> (
+	vk.Pipeline,
+	vk.PipelineLayout,
+	bool,
+) {
+	// 1. Load Shader Modules
+	// (Ensure you have the helper function 'create_shader_module' from the previous step)
+	vert_module, v_ok := create_shader_module(device, "shaders/vert.spv")
+	frag_module, f_ok := create_shader_module(device, "shaders/frag.spv")
+
+	if !v_ok || !f_ok {
+		return {}, {}, false
+	}
+
+	// We destroy the modules at the end of this function.
+	// Once the pipeline is compiled, it doesn't need the modules anymore.
+	defer vk.DestroyShaderModule(device, vert_module, nil)
+	defer vk.DestroyShaderModule(device, frag_module, nil)
+
+	// 2. Shader Stages Creation Info
+	vert_stage_info := vk.PipelineShaderStageCreateInfo {
+		sType  = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+		stage  = {.VERTEX},
+		module = vert_module,
+		pName  = "main", // The entry point function name in GLSL
+	}
+
+	frag_stage_info := vk.PipelineShaderStageCreateInfo {
+		sType  = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+		stage  = {.FRAGMENT},
+		module = frag_module,
+		pName  = "main",
+	}
+
+	shader_stages := []vk.PipelineShaderStageCreateInfo{vert_stage_info, frag_stage_info}
+
+	// 3. Vertex Input (Empty for now because we hardcoded points in the shader)
+	vertex_input_info := vk.PipelineVertexInputStateCreateInfo {
+		sType                           = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		vertexBindingDescriptionCount   = 0,
+		vertexAttributeDescriptionCount = 0,
+	}
+
+	// 4. Input Assembly (Triangles)
+	input_assembly := vk.PipelineInputAssemblyStateCreateInfo {
+		sType                  = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		topology               = .TRIANGLE_LIST, // Every 3 vertices = 1 triangle
+		primitiveRestartEnable = false,
+	}
+
+	// 5. Dynamic States
+	// We want to be able to resize the window without recreating the entire pipeline
+	dynamic_states := []vk.DynamicState{.VIEWPORT, .SCISSOR}
+	dynamic_state_info := vk.PipelineDynamicStateCreateInfo {
+		sType             = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		dynamicStateCount = u32(len(dynamic_states)),
+		pDynamicStates    = raw_data(dynamic_states),
+	}
+
+	// 6. Viewport & Scissor (Values don't matter much here since they are Dynamic)
+	viewport_state := vk.PipelineViewportStateCreateInfo {
+		sType         = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		viewportCount = 1,
+		scissorCount  = 1,
+	}
+
+	// 7. Rasterizer (Fill mode, Culling)
+	rasterizer := vk.PipelineRasterizationStateCreateInfo {
+		sType                   = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		depthClampEnable        = false,
+		rasterizerDiscardEnable = false,
+		polygonMode             = .FILL, // Fill the triangle with color
+		lineWidth               = 1.0,
+		cullMode                = {.BACK}, // Don't draw the back of the triangle
+		frontFace               = .CLOCKWISE,
+		depthBiasEnable         = false,
+	}
+
+	// 8. Multisampling (Disabled for now)
+	multisampling := vk.PipelineMultisampleStateCreateInfo {
+		sType                = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		sampleShadingEnable  = false,
+		rasterizationSamples = {._1},
+	}
+
+	// 9. Color Blending (Standard mixing)
+	color_blend_attachment := vk.PipelineColorBlendAttachmentState {
+		colorWriteMask = {.R, .G, .B, .A},
+		blendEnable    = false, // Set to true for transparency
+	}
+
+	color_blending := vk.PipelineColorBlendStateCreateInfo {
+		sType           = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		logicOpEnable   = false,
+		attachmentCount = 1,
+		pAttachments    = &color_blend_attachment,
+	}
+
+	// 10. Pipeline Layout (Global variables/Uniforms)
+	// Empty for now
+	pipeline_layout_info := vk.PipelineLayoutCreateInfo {
+		sType = .PIPELINE_LAYOUT_CREATE_INFO,
+	}
+
+	pipeline_layout: vk.PipelineLayout
+	if res := vk.CreatePipelineLayout(device, &pipeline_layout_info, nil, &pipeline_layout);
+	   res != .SUCCESS {
+		log.errorf("Failed to create pipeline layout: %v", res)
+		return {}, {}, false
+	}
+
+	// 11. Create the Actual Pipeline
+	pipeline_info := vk.GraphicsPipelineCreateInfo {
+		sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
+		stageCount          = 2,
+		pStages             = raw_data(shader_stages),
+		pVertexInputState   = &vertex_input_info,
+		pInputAssemblyState = &input_assembly,
+		pViewportState      = &viewport_state,
+		pRasterizationState = &rasterizer,
+		pMultisampleState   = &multisampling,
+		pColorBlendState    = &color_blending,
+		pDynamicState       = &dynamic_state_info,
+		layout              = pipeline_layout,
+		renderPass          = render_pass,
+		subpass             = 0,
+	}
+
+	graphics_pipeline: vk.Pipeline
+	if res := vk.CreateGraphicsPipelines(device, {}, 1, &pipeline_info, nil, &graphics_pipeline);
+	   res != .SUCCESS {
+		log.errorf("Failed to create graphics pipeline: %v", res)
+		return {}, {}, false
+	}
+
+	log.info("Graphics Pipeline Created Successfully!")
+	return graphics_pipeline, pipeline_layout, true
 }
