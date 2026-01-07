@@ -854,6 +854,11 @@ record_command_buffer :: proc(
 
 	vk.CmdBeginRenderPass(buffer, &render_pass_info, .INLINE)
 
+	// Drawing commands go here
+
+	// vk.CmdBindPipeline(...)
+	// vk.CmdDraw(...)
+
 	// Bind the pipeline
 	vk.CmdBindPipeline(buffer, .GRAPHICS, pipeline)
 
@@ -877,11 +882,6 @@ record_command_buffer :: proc(
 
 	// Draw Triangle
 	vk.CmdDraw(buffer, 3, 1, 0, 0)
-
-
-	// Drawing commands go here
-	// vk.CmdBindPipeline(...)
-	// vk.CmdDraw(...)
 
 
 	// End Drawing
