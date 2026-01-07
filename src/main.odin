@@ -1027,8 +1027,7 @@ create_graphics_pipeline :: proc(
 	vk.PipelineLayout,
 	bool,
 ) {
-	// 1. Load Shader Modules
-	// (Ensure you have the helper function 'create_shader_module' from the previous step)
+	// Load Shader Modules
 	vert_module, v_ok := create_shader_module(device, "shaders/vert.spv")
 	frag_module, f_ok := create_shader_module(device, "shaders/frag.spv")
 
@@ -1036,12 +1035,10 @@ create_graphics_pipeline :: proc(
 		return {}, {}, false
 	}
 
-	// We destroy the modules at the end of this function.
-	// Once the pipeline is compiled, it doesn't need the modules anymore.
 	defer vk.DestroyShaderModule(device, vert_module, nil)
 	defer vk.DestroyShaderModule(device, frag_module, nil)
 
-	// 2. Shader Stages Creation Info
+	// Shader Stages Creation Info
 	vert_stage_info := vk.PipelineShaderStageCreateInfo {
 		sType  = .PIPELINE_SHADER_STAGE_CREATE_INFO,
 		stage  = {.VERTEX},
@@ -1058,22 +1055,21 @@ create_graphics_pipeline :: proc(
 
 	shader_stages := []vk.PipelineShaderStageCreateInfo{vert_stage_info, frag_stage_info}
 
-	// 3. Vertex Input (Empty for now because we hardcoded points in the shader)
+	// Vertex Input (Empty for now because hardcoded points in the shader)
 	vertex_input_info := vk.PipelineVertexInputStateCreateInfo {
 		sType                           = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 		vertexBindingDescriptionCount   = 0,
 		vertexAttributeDescriptionCount = 0,
 	}
 
-	// 4. Input Assembly (Triangles)
+	// Input Assembly (Triangles)
 	input_assembly := vk.PipelineInputAssemblyStateCreateInfo {
 		sType                  = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
 		topology               = .TRIANGLE_LIST, // Every 3 vertices = 1 triangle
 		primitiveRestartEnable = false,
 	}
 
-	// 5. Dynamic States
-	// We want to be able to resize the window without recreating the entire pipeline
+	// Dynamic States
 	dynamic_states := []vk.DynamicState{.VIEWPORT, .SCISSOR}
 	dynamic_state_info := vk.PipelineDynamicStateCreateInfo {
 		sType             = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
@@ -1081,14 +1077,14 @@ create_graphics_pipeline :: proc(
 		pDynamicStates    = raw_data(dynamic_states),
 	}
 
-	// 6. Viewport & Scissor (Values don't matter much here since they are Dynamic)
+	// Viewport & Scissor (Values don't matter much here since they are Dynamic)
 	viewport_state := vk.PipelineViewportStateCreateInfo {
 		sType         = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
 		viewportCount = 1,
 		scissorCount  = 1,
 	}
 
-	// 7. Rasterizer (Fill mode, Culling)
+	// Rasterizer (Fill mode, Culling)
 	rasterizer := vk.PipelineRasterizationStateCreateInfo {
 		sType                   = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
 		depthClampEnable        = false,
@@ -1100,14 +1096,14 @@ create_graphics_pipeline :: proc(
 		depthBiasEnable         = false,
 	}
 
-	// 8. Multisampling (Disabled for now)
+	// Multisampling (Disabled for now)
 	multisampling := vk.PipelineMultisampleStateCreateInfo {
 		sType                = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
 		sampleShadingEnable  = false,
 		rasterizationSamples = {._1},
 	}
 
-	// 9. Color Blending (Standard mixing)
+	// Color Blending (Standard mixing)
 	color_blend_attachment := vk.PipelineColorBlendAttachmentState {
 		colorWriteMask = {.R, .G, .B, .A},
 		blendEnable    = false, // Set to true for transparency
@@ -1120,8 +1116,7 @@ create_graphics_pipeline :: proc(
 		pAttachments    = &color_blend_attachment,
 	}
 
-	// 10. Pipeline Layout (Global variables/Uniforms)
-	// Empty for now
+	// Pipeline Layout (Global variables/Uniforms)
 	pipeline_layout_info := vk.PipelineLayoutCreateInfo {
 		sType = .PIPELINE_LAYOUT_CREATE_INFO,
 	}
@@ -1133,7 +1128,7 @@ create_graphics_pipeline :: proc(
 		return {}, {}, false
 	}
 
-	// 11. Create the Actual Pipeline
+	// Create the Actual Pipeline
 	pipeline_info := vk.GraphicsPipelineCreateInfo {
 		sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
 		stageCount          = 2,
