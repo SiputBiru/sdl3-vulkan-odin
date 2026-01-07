@@ -1,0 +1,957 @@
+package main
+
+import "base:runtime"
+import "core:fmt"
+import "core:image"
+import "core:log"
+import "core:slice"
+import sdl "vendor:sdl3"
+import vk "vendor:vulkan"
+
+TITLE: cstring : "Odin + Vulkan + SDL3"
+WIDTH: i32 : 1280
+HEIGHT: i32 : 720
+
+VALIDATION_LAYERS := []cstring{"VK_LAYER_KHRONOS_validation"}
+
+
+// Swapchain struct
+SwapchainBundle :: struct {
+	handle:      vk.SwapchainKHR,
+	format:      vk.Format,
+	extent:      vk.Extent2D,
+	images:      []vk.Image,
+	image_views: []vk.ImageView,
+}
+
+// Sync things (Semaphore and Fence)
+MAX_FRAMES_IN_FLIGHT :: 4
+SyncObjects :: struct {
+	image_available_semaphores: []vk.Semaphore,
+	render_finished_semaphores: []vk.Semaphore,
+	in_flight_fences:           []vk.Fence,
+}
+
+main :: proc() {
+	context.logger = log.create_console_logger()
+
+	if !sdl.Init({.VIDEO}) {
+		log.errorf("SDL Init Failure: %s", sdl.GetError())
+		return
+	}
+	defer sdl.Quit()
+
+	window := sdl.CreateWindow(TITLE, WIDTH, HEIGHT, {.VULKAN, .RESIZABLE})
+	if window == nil {
+		log.errorf("Window Creation Failure: %s", sdl.GetError())
+		return
+	}
+	defer sdl.DestroyWindow(window)
+
+	if !sdl.Vulkan_LoadLibrary(nil) {
+		log.errorf("Failed to load Vulkan Library: %s", sdl.GetError())
+		return
+	}
+	defer sdl.Vulkan_UnloadLibrary()
+
+	vk.load_proc_addresses_global(cast(rawptr)sdl.Vulkan_GetVkGetInstanceProcAddr())
+
+	// --- EXTENSION MANAGEMENT ---
+	sdl_ext_count: u32
+	sdl_ext_ptr := sdl.Vulkan_GetInstanceExtensions(&sdl_ext_count)
+	if sdl_ext_ptr == nil {
+		log.error("Failed to get SDL Vulkan extensions")
+		return
+	}
+
+	sdl_extensions := slice.from_ptr(sdl_ext_ptr, int(sdl_ext_count))
+
+	// Create new list: SDL Extensions + Debug Extension
+	all_extensions := make([dynamic]cstring)
+	defer delete(all_extensions)
+
+	append(&all_extensions, ..sdl_extensions)
+	append(&all_extensions, vk.EXT_DEBUG_UTILS_EXTENSION_NAME)
+
+	log.infof("Enabled Extensions: %v", all_extensions)
+
+	// Define the Debug Info (chained to Instance Creation)
+	debug_create_info := vk.DebugUtilsMessengerCreateInfoEXT {
+		sType           = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+		messageSeverity = {.VERBOSE, .WARNING, .ERROR},
+		messageType     = {.GENERAL, .VALIDATION, .PERFORMANCE},
+		pfnUserCallback = debug_callback, // Make sure this function exists!
+	}
+
+	app_info := vk.ApplicationInfo {
+		sType              = .APPLICATION_INFO,
+		pApplicationName   = "Odin Vulkan SDL3",
+		applicationVersion = vk.MAKE_VERSION(1, 0, 0),
+		pEngineName        = "No Engine",
+		engineVersion      = vk.MAKE_VERSION(1, 0, 0),
+		apiVersion         = vk.API_VERSION_1_3,
+	}
+
+	// --- CRITICAL FIXES HERE ---
+	create_info := vk.InstanceCreateInfo {
+		sType                   = .INSTANCE_CREATE_INFO,
+		pApplicationInfo        = &app_info,
+
+		// 1. Link the Debug Info so we catch creation errors
+		pNext                   = &debug_create_info,
+
+		// 2. Use 'all_extensions', not the raw SDL pointer
+		enabledExtensionCount   = u32(len(all_extensions)),
+		ppEnabledExtensionNames = raw_data(all_extensions),
+
+		// 3. Enable the Validation Layers
+		enabledLayerCount       = u32(len(VALIDATION_LAYERS)),
+		ppEnabledLayerNames     = raw_data(VALIDATION_LAYERS),
+	}
+
+	instance: vk.Instance
+	if res := vk.CreateInstance(&create_info, nil, &instance); res != .SUCCESS {
+		log.errorf("Failed to create Vulkan Instance: %v", res)
+		return
+	}
+	defer vk.DestroyInstance(instance, nil)
+
+	vk.load_proc_addresses(instance)
+
+	// Optional: Create the persistent messenger if you want debugging after instance creation
+	// (The pNext above only handles creation-time debugging)
+	debug_messenger: vk.DebugUtilsMessengerEXT
+	if vk.CreateDebugUtilsMessengerEXT != nil {
+		vk.CreateDebugUtilsMessengerEXT(instance, &debug_create_info, nil, &debug_messenger)
+	}
+	defer if vk.DestroyDebugUtilsMessengerEXT != nil {
+		vk.DestroyDebugUtilsMessengerEXT(instance, debug_messenger, nil)
+	}
+
+	// Create VK surface
+	surface: vk.SurfaceKHR
+	if !sdl.Vulkan_CreateSurface(window, instance, nil, &surface) {
+		log.errorf("Failed to create Vulkan Surface: %s", sdl.GetError())
+		return
+	}
+	defer vk.DestroySurfaceKHR(instance, surface, nil)
+
+	// Pick GPU
+	physical_device, found := pick_physical_device(instance)
+	if !found {
+		log.error("Failed to find a suitable GPU!")
+		return
+	}
+
+	// print the best gpu that will be selected
+	props: vk.PhysicalDeviceProperties
+	vk.GetPhysicalDeviceProperties(physical_device, &props)
+	log.infof("Selected GPU: %s", props.deviceName)
+
+	// --- Create Logical Device ---
+	device: vk.Device
+	graphics_queue: vk.Queue
+	graphics_queue_family_index: u32
+	device_created: bool
+
+	device, graphics_queue, graphics_queue_family_index, device_created = create_logical_device(
+		physical_device,
+		surface,
+	)
+
+	if !device_created {
+		return
+	}
+	defer vk.DestroyDevice(device, nil)
+
+	vk.load_proc_addresses(device)
+
+	log.info("Logical Device Created Successfully!")
+
+	// --- Create Swapchain ---
+	swapchain: SwapchainBundle
+	swapchain_ok: bool
+
+	swapchain, swapchain_ok = create_swapchain(
+		physical_device,
+		device,
+		surface,
+		window,
+		graphics_queue_family_index,
+	)
+
+	if !swapchain_ok {
+		return
+	}
+
+	// Create render Pass
+	render_pass, rp_ok := create_render_pass(device, swapchain.format)
+	if !rp_ok {
+		return
+	}
+
+	// Create FrameBuffers
+	framebuffers, fb_ok := create_framebuffers(device, render_pass, &swapchain)
+	if !fb_ok {
+		return
+	}
+
+	// Create Command Pool
+	command_pool, pool_ok := create_command_pool(device, graphics_queue_family_index)
+	if !pool_ok {
+		return
+	}
+
+	// Create COmmand Buffers
+	command_buffers, buffers_ok := create_command_buffers(
+		device,
+		command_pool,
+		u32(len(framebuffers)),
+	)
+	if !buffers_ok {
+		return
+	}
+
+	// Create Sync Objects
+	sync_objects, sync_ok := create_sync_objects(device)
+	if !sync_ok {
+		return
+	}
+
+	// Cleanup
+	defer {
+		// Destroy Sync Objects
+		for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
+			vk.DestroySemaphore(device, sync_objects.render_finished_semaphores[i], nil)
+			vk.DestroySemaphore(device, sync_objects.image_available_semaphores[i], nil)
+			vk.DestroyFence(device, sync_objects.in_flight_fences[i], nil)
+		}
+		delete(sync_objects.render_finished_semaphores)
+		delete(sync_objects.image_available_semaphores)
+		delete(sync_objects.in_flight_fences)
+
+		// Delete command Buffer
+		delete(command_buffers)
+
+		// Destroy command Pool
+		vk.DestroyCommandPool(device, command_pool, nil)
+
+		// Destroy framebuffers
+		for fb in framebuffers {
+			vk.DestroyFramebuffer(device, fb, nil)
+		}
+		delete(framebuffers)
+
+		// Destroy render pass
+		vk.DestroyRenderPass(device, render_pass, nil)
+		for view in swapchain.image_views {
+			vk.DestroyImageView(device, view, nil)
+		}
+		delete(swapchain.image_views)
+		delete(swapchain.images) // Just delete the Odin slice, not the handles (swapchain owns them)
+		vk.DestroySwapchainKHR(device, swapchain.handle, nil)
+	}
+
+	log.info("Vulkan Initialized successfully!")
+
+
+	current_frame := 0
+	// Main Loop
+	running := true
+	for running {
+		event: sdl.Event
+		for sdl.PollEvent(&event) {
+			if event.type == .QUIT {
+				running = false
+			}
+		}
+		draw_frame(
+			device,
+			graphics_queue,
+			graphics_queue, // We use the same queue for both
+			&swapchain,
+			&sync_objects,
+			command_buffers,
+			render_pass,
+			framebuffers,
+			&current_frame,
+		)
+
+	}
+	// Wait for GPU to finish before cleaning up
+	vk.DeviceWaitIdle(device)
+}
+
+// --- CALLBACK FUNCTION ---
+debug_callback :: proc "system" (
+	messageSeverity: vk.DebugUtilsMessageSeverityFlagsEXT,
+	messageTypes: vk.DebugUtilsMessageTypeFlagsEXT,
+	pCallbackData: ^vk.DebugUtilsMessengerCallbackDataEXT,
+	pUserData: rawptr,
+) -> b32 {
+
+	context = runtime.default_context()
+
+	if .ERROR in messageSeverity {
+		fmt.printf("[VK ERROR] %s\n", pCallbackData.pMessage)
+	} else if .WARNING in messageSeverity {
+		fmt.printf("[VK WARN]  %s\n", pCallbackData.pMessage)
+	}
+
+	return false
+}
+
+// --- pick Physical device ----
+pick_physical_device :: proc(instance: vk.Instance) -> (vk.PhysicalDevice, bool) {
+	// check how many gpu is there
+	device_count: u32
+	vk.EnumeratePhysicalDevices(instance, &device_count, nil)
+	if device_count == 0 {
+		return nil, false
+	}
+
+
+	// get the actual device
+	devices := make([]vk.PhysicalDevice, device_count)
+	defer delete(devices)
+	vk.EnumeratePhysicalDevices(instance, &device_count, raw_data(devices))
+
+
+	// check them then pick the best one
+	best_device: vk.PhysicalDevice
+	best_score := -1
+
+	for device in devices {
+		props: vk.PhysicalDeviceProperties
+		vk.GetPhysicalDeviceProperties(device, &props)
+
+		score := 0
+
+		// Discrete GPUs (Dedicated cards like NVIDIA/AMD) are usually better
+		if props.deviceType == .DISCRETE_GPU {
+			score += 1000
+		}
+		// Integrated GPUs (Intel HD/Iris, AMD APU)
+		if props.deviceType == .INTEGRATED_GPU {
+			score += 100
+		}
+
+		// Maximum texture size is a decent tie-breaker
+		score += int(props.limits.maxImageDimension2D)
+
+		log.infof("Found GPU: %s (Score: %d)", props.deviceName, score)
+
+		if score > best_score {
+			best_device = device
+			best_score = score
+		}
+	}
+
+	if best_score > 0 {
+		return best_device, true
+	}
+
+	return nil, false
+
+}
+
+create_logical_device :: proc(
+	physical_device: vk.PhysicalDevice,
+	surface: vk.SurfaceKHR,
+) -> (
+	vk.Device,
+	vk.Queue,
+	u32,
+	bool,
+) {
+	// find Queues Family
+	queue_family_count: u32
+
+	vk.GetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, nil)
+
+	queue_families := make([]vk.QueueFamilyProperties, queue_family_count)
+	defer delete(queue_families)
+	vk.GetPhysicalDeviceQueueFamilyProperties(
+		physical_device,
+		&queue_family_count,
+		raw_data(queue_families),
+	)
+
+	graphics_family_index := -1
+
+	//
+	for family, i in queue_families {
+		// Check for Graphics support
+		if .GRAPHICS in family.queueFlags {
+			// Check for Presentation support
+			present_support: b32
+			vk.GetPhysicalDeviceSurfaceSupportKHR(
+				physical_device,
+				u32(i),
+				surface,
+				&present_support,
+			)
+
+			if present_support {
+				graphics_family_index = i
+				break
+			}
+		}
+	}
+
+	if graphics_family_index == -1 {
+		log.error("Failed to find a Queue Family that supports both Graphics and Presentation")
+		return nil, nil, 0, false
+	}
+
+	log.infof("Using Queue Family Index: %d", graphics_family_index)
+
+	// prepare Queue Creation info
+	queue_priority: f32 = 1.0
+
+	queue_create_info := vk.DeviceQueueCreateInfo {
+		sType            = .DEVICE_QUEUE_CREATE_INFO,
+		queueFamilyIndex = u32(graphics_family_index),
+		queueCount       = 1,
+		pQueuePriorities = &queue_priority,
+	}
+
+	// Required device extensions
+	device_extensions := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
+
+	// create logical device
+	device_features := vk.PhysicalDeviceFeatures{} // TODO: enabling features here later
+
+	create_info := vk.DeviceCreateInfo {
+		sType                   = .DEVICE_CREATE_INFO,
+		queueCreateInfoCount    = 1,
+		pQueueCreateInfos       = &queue_create_info,
+		pEnabledFeatures        = &device_features,
+		enabledExtensionCount   = u32(len(device_extensions)),
+		ppEnabledExtensionNames = raw_data(device_extensions),
+	}
+
+	device: vk.Device
+	if res := vk.CreateDevice(physical_device, &create_info, nil, &device); res != .SUCCESS {
+		log.errorf("Failed to create Logical Device: %v", res)
+		return nil, nil, 0, false
+	}
+
+	// retrieve queue handle
+	graphics_queue: vk.Queue
+	vk.GetDeviceQueue(device, u32(graphics_family_index), 0, &graphics_queue)
+	return device, graphics_queue, u32(graphics_family_index), true
+
+}
+
+create_swapchain :: proc(
+	physical_device: vk.PhysicalDevice,
+	device: vk.Device,
+	surface: vk.SurfaceKHR,
+	window: ^sdl.Window,
+	graphics_family_index: u32,
+) -> (
+	SwapchainBundle,
+	bool,
+) {
+	bundle: SwapchainBundle
+
+	// Queries surface Capabilities
+	capabilities: vk.SurfaceCapabilitiesKHR
+	vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities)
+
+	// Choose the resolution
+	if capabilities.currentExtent.width != max(u32) {
+		bundle.extent = capabilities.currentExtent
+	} else {
+		w, h: i32
+		sdl.GetWindowSizeInPixels(window, &w, &h)
+		bundle.extent.width = u32(w)
+		bundle.extent.height = u32(h)
+
+		// clamp to min/max allowed by the GPU
+		bundle.extent.width = clamp(
+			bundle.extent.width,
+			capabilities.minImageExtent.width,
+			capabilities.maxImageExtent.width,
+		)
+		bundle.extent.height = clamp(
+			bundle.extent.height,
+			capabilities.minImageExtent.height,
+			capabilities.maxImageExtent.height,
+		)
+	}
+
+	// Choose surface format (Color Space)
+	format_count: u32
+	vk.GetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, nil)
+	formats := make([]vk.SurfaceFormatKHR, format_count)
+	defer delete(formats)
+	vk.GetPhysicalDeviceSurfaceFormatsKHR(
+		physical_device,
+		surface,
+		&format_count,
+		raw_data(formats),
+	)
+
+	// Default fallback
+	bundle.format = formats[0].format
+	color_space := formats[0].colorSpace
+
+	for f in formats {
+		// Prefer standard SRGB (standard monitor colors)
+		if f.format == .B8G8R8A8_SRGB && f.colorSpace == .SRGB_NONLINEAR {
+			bundle.format = f.format
+			color_space = f.colorSpace
+			break
+		}
+	}
+
+
+	// choose present mode
+	present_mode_count: u32
+	vk.GetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_mode_count, nil)
+	present_modes := make([]vk.PresentModeKHR, present_mode_count)
+	defer delete(present_modes)
+	vk.GetPhysicalDeviceSurfacePresentModesKHR(
+		physical_device,
+		surface,
+		&present_mode_count,
+		raw_data(present_modes),
+	)
+
+	// FIFO is guaranteed to exist (this is standard V-Sync)
+	present_mode := vk.PresentModeKHR.FIFO
+
+	// for mode in present_modes {
+	// 	// MAILBOX is "Triple Buffering". It allows unlimited FPS without screen tearing.
+	// 	if mode == .MAILBOX {
+	// 		present_mode = .MAILBOX
+	// 		break
+	// 	}
+	// }
+
+	// Image count
+	// Triple buffering needs 3 images
+	image_count := capabilities.minImageCount + 1
+	if capabilities.maxImageCount > 0 && image_count > capabilities.maxImageCount {
+		image_count = capabilities.maxImageCount
+	}
+
+	// create the Swapchain
+	create_info := vk.SwapchainCreateInfoKHR {
+		sType            = .SWAPCHAIN_CREATE_INFO_KHR,
+		surface          = surface,
+		minImageCount    = image_count,
+		imageFormat      = bundle.format,
+		imageColorSpace  = color_space,
+		imageExtent      = bundle.extent,
+		imageArrayLayers = 1, // Always 1 unless doing VR/Stereo 3D
+		imageUsage       = {.COLOR_ATTACHMENT}, // We will draw color to these images
+		preTransform     = capabilities.currentTransform,
+		compositeAlpha   = {.OPAQUE},
+		presentMode      = present_mode,
+		clipped          = true, // Don't calculate pixels covered by other windows
+		oldSwapchain     = {}, // Used when resizing window later
+	}
+
+	// Explicitly state using one queue for both Graphics and Present
+	create_info.imageSharingMode = .EXCLUSIVE
+
+	if res := vk.CreateSwapchainKHR(device, &create_info, nil, &bundle.handle); res != .SUCCESS {
+		log.errorf("Failed to create Swapchain: %v", res)
+		return bundle, false
+	}
+
+	// Retrive Images and Create Views
+	vk.GetSwapchainImagesKHR(device, bundle.handle, &image_count, nil)
+	bundle.images = make([]vk.Image, image_count)
+	vk.GetSwapchainImagesKHR(device, bundle.handle, &image_count, raw_data(bundle.images))
+
+	bundle.image_views = make([]vk.ImageView, image_count)
+
+	for i in 0 ..< image_count {
+		view_info := vk.ImageViewCreateInfo {
+			sType = .IMAGE_VIEW_CREATE_INFO,
+			image = bundle.images[i],
+			viewType = .D2, // It's a 2D image
+			format = bundle.format,
+			components = { 	// Default mapping (R->R, G->G, etc)
+				r = .IDENTITY,
+				g = .IDENTITY,
+				b = .IDENTITY,
+				a = .IDENTITY,
+			},
+			subresourceRange = {
+				aspectMask = {.COLOR},
+				baseMipLevel = 0,
+				levelCount = 1,
+				baseArrayLayer = 0,
+				layerCount = 1,
+			},
+		}
+
+		if res := vk.CreateImageView(device, &view_info, nil, &bundle.image_views[i]);
+		   res != .SUCCESS {
+			log.error("Failed to create Swapchain Image View")
+			return bundle, false
+		}
+	}
+
+	log.infof(
+		"Swapchain Created! Size: %dx%d | Mode: %v | Images: %d",
+		bundle.extent.width,
+		bundle.extent.height,
+		present_mode,
+		len(bundle.images),
+	)
+
+	return bundle, true
+}
+
+create_render_pass :: proc(
+	device: vk.Device,
+	swapchain_format: vk.Format,
+) -> (
+	vk.RenderPass,
+	bool,
+) {
+	color_attachment := vk.AttachmentDescription {
+		format         = swapchain_format,
+		samples        = {._1},
+
+		// like gl Clear
+		loadOp         = .CLEAR,
+
+		// save the result
+		storeOp        = .STORE,
+
+		// Stecil not used right now
+		stencilLoadOp  = .DONT_CARE,
+		stencilStoreOp = .DONT_CARE,
+
+		// Layout Transition
+		initialLayout  = .UNDEFINED,
+
+		// final Layout
+		finalLayout    = .PRESENT_SRC_KHR,
+	}
+
+	// Subpass references
+	color_attachment_ref := vk.AttachmentReference {
+		attachment = 0, // index in the pAttachment array below
+		layout     = .COLOR_ATTACHMENT_OPTIMAL,
+	}
+
+	// subpass description
+	subpass := vk.SubpassDescription {
+		pipelineBindPoint    = .GRAPHICS,
+		colorAttachmentCount = 1,
+		pColorAttachments    = &color_attachment_ref,
+	}
+
+	// Subpass Dependecy
+	dependency := vk.SubpassDependency {
+		srcSubpass    = vk.SUBPASS_EXTERNAL,
+		dstSubpass    = 0,
+
+		// wait for color attachment
+		srcStageMask  = {.COLOR_ATTACHMENT_OUTPUT},
+		srcAccessMask = {},
+		dstStageMask  = {.COLOR_ATTACHMENT_OUTPUT},
+		dstAccessMask = {.COLOR_ATTACHMENT_WRITE},
+	}
+
+	// Create the Render Pass
+	render_pass_info := vk.RenderPassCreateInfo {
+		sType           = .RENDER_PASS_CREATE_INFO,
+		attachmentCount = 1,
+		pAttachments    = &color_attachment,
+		subpassCount    = 1,
+		pSubpasses      = &subpass,
+		dependencyCount = 1,
+		pDependencies   = &dependency,
+	}
+
+	render_pass: vk.RenderPass
+	if res := vk.CreateRenderPass(device, &render_pass_info, nil, &render_pass); res != .SUCCESS {
+		log.errorf("Failed to create Render Pass: %v", res)
+		return {}, false
+	}
+
+	log.info("Render Pass Created Successfully")
+	return render_pass, true
+}
+
+create_framebuffers :: proc(
+	device: vk.Device,
+	render_pass: vk.RenderPass,
+	swapchain: ^SwapchainBundle,
+) -> (
+	[]vk.Framebuffer,
+	bool,
+) {
+	buffers := make([]vk.Framebuffer, len(swapchain.image_views))
+
+	for i in 0 ..< len(swapchain.image_views) {
+		// specific attachment for this framebuffer
+		attachments := []vk.ImageView{swapchain.image_views[i]}
+
+		framebuffers_info := vk.FramebufferCreateInfo {
+			sType           = .FRAMEBUFFER_CREATE_INFO,
+			renderPass      = render_pass,
+			attachmentCount = 1,
+			pAttachments    = raw_data(attachments),
+
+			// dimension
+			width           = swapchain.extent.width,
+			height          = swapchain.extent.height,
+			layers          = 1,
+		}
+
+		if res := vk.CreateFramebuffer(device, &framebuffers_info, nil, &buffers[i]);
+		   res != .SUCCESS {
+			log.errorf("Failed to create Framebuffer %d: %v", i, res)
+			// If one fails, we should probably cleanup what we made,
+			// but for simplicity here we just return failure.
+			return nil, false
+		}
+	}
+
+
+	log.infof("Created %d Framebuffers", len(buffers))
+	return buffers, true
+}
+
+create_command_pool :: proc(device: vk.Device, queue_family_index: u32) -> (vk.CommandPool, bool) {
+	pool_info := vk.CommandPoolCreateInfo {
+		sType            = .COMMAND_POOL_CREATE_INFO,
+		queueFamilyIndex = queue_family_index,
+		// allow to re-record buffers individually
+		flags            = {.RESET_COMMAND_BUFFER},
+	}
+	pool: vk.CommandPool
+	if res := vk.CreateCommandPool(device, &pool_info, nil, &pool); res != .SUCCESS {
+		log.errorf("Failed to create Command Pool: %v", res)
+		return {}, false
+	}
+
+	log.info("Command Pool Created Successfully")
+	return pool, true
+
+}
+
+create_command_buffers :: proc(
+	device: vk.Device,
+	pool: vk.CommandPool,
+	count: u32,
+) -> (
+	[]vk.CommandBuffer,
+	bool,
+) {
+	buffers := make([]vk.CommandBuffer, count)
+
+	alloc_info := vk.CommandBufferAllocateInfo {
+		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool        = pool,
+		commandBufferCount = count,
+		level              = .PRIMARY, // Can be submitted to a queue directly
+	}
+
+	if res := vk.AllocateCommandBuffers(device, &alloc_info, raw_data(buffers)); res != .SUCCESS {
+		log.errorf("Failed to create Command Buffers: %v", res)
+		delete(buffers)
+		return {}, false
+	}
+
+	log.infof("Allocated %d Command Buffers", count)
+	return buffers, true
+}
+
+create_sync_objects :: proc(device: vk.Device) -> (SyncObjects, bool) {
+	sync: SyncObjects
+
+	// Resize Array to match frames in Flight
+	sync.image_available_semaphores = make([]vk.Semaphore, MAX_FRAMES_IN_FLIGHT)
+	sync.render_finished_semaphores = make([]vk.Semaphore, MAX_FRAMES_IN_FLIGHT)
+	sync.in_flight_fences = make([]vk.Fence, MAX_FRAMES_IN_FLIGHT)
+
+	// Info for creating semaphore (just basic things)
+	semaphore_info := vk.SemaphoreCreateInfo {
+		sType = .SEMAPHORE_CREATE_INFO,
+	}
+
+	// Info for creating Fence
+	fence_info := vk.FenceCreateInfo {
+		sType = .FENCE_CREATE_INFO,
+
+		// CRITICAL: Create them in the SIGNALED state.
+		// If we don't, the very first loop will wait forever for a "previous frame"
+		// that never existed.
+		flags = {.SIGNALED},
+	}
+
+	// error checking
+	for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
+		if vk.CreateSemaphore(device, &semaphore_info, nil, &sync.image_available_semaphores[i]) !=
+			   .SUCCESS ||
+		   vk.CreateSemaphore(device, &semaphore_info, nil, &sync.render_finished_semaphores[i]) !=
+			   .SUCCESS ||
+		   vk.CreateFence(device, &fence_info, nil, &sync.in_flight_fences[i]) != .SUCCESS {
+
+			log.error("Failed to create synchronization objects for a frame!")
+			return sync, false
+		}
+	}
+
+	log.infof("Synchronization Objects Created Successfully")
+	return sync, true
+}
+
+record_command_buffer :: proc(
+	buffer: vk.CommandBuffer,
+	image_index: u32,
+	render_pass: vk.RenderPass,
+	framebuffers: []vk.Framebuffer,
+	extent: vk.Extent2D,
+) {
+	// Begin Recording
+	begin_info := vk.CommandBufferBeginInfo {
+		sType = .COMMAND_BUFFER_BEGIN_INFO,
+		flags = {}, // Optional
+	}
+
+	if vk.BeginCommandBuffer(buffer, &begin_info) != .SUCCESS {
+		log.errorf("Failed to begin recording command buffer!")
+		return
+	}
+
+	// Define the clear color
+	clear_color := vk.ClearValue{}
+	clear_color.color.float32 = {0.5, 0.0, 0.5, 1.0}
+
+	// start render pass
+	render_pass_info := vk.RenderPassBeginInfo {
+		sType = .RENDER_PASS_BEGIN_INFO,
+		renderPass = render_pass,
+		framebuffer = framebuffers[image_index],
+		renderArea = {offset = {0.0, 0.0}, extent = extent},
+		clearValueCount = 1,
+		pClearValues = &clear_color,
+	}
+
+	vk.CmdBeginRenderPass(buffer, &render_pass_info, .INLINE)
+
+
+	// Drawing commands go here
+	// vk.CmdBindPipeline(...)
+	// vk.CmdDraw(...)
+
+
+	// End Drawing
+	vk.CmdEndRenderPass(buffer)
+	if vk.EndCommandBuffer(buffer) != .SUCCESS {
+		log.error("Failed to record command buffers!")
+	}
+
+}
+
+draw_frame :: proc(
+	device: vk.Device,
+	graphics_queue: vk.Queue,
+	present_queue: vk.Queue, // this is the same as graphics_queue
+	swapchain: ^SwapchainBundle,
+	sync: ^SyncObjects,
+	command_buffers: []vk.CommandBuffer,
+	render_pass: vk.RenderPass,
+	framebuffers: []vk.Framebuffer,
+	current_frame: ^int,
+) {
+	// wait previous frame to finish
+	vk.WaitForFences(device, 1, &sync.in_flight_fences[current_frame^], true, max(u64))
+
+
+	// Acquire an Image from the swapchain
+	image_index: u32
+	result := vk.AcquireNextImageKHR(
+		device,
+		swapchain.handle,
+		max(u64),
+		sync.image_available_semaphores[current_frame^],
+		{},
+		&image_index,
+	)
+
+
+	// Handle window resizing (OUT_OF_DATE) later. For now, just exit if failed.
+	// if result != .SUCCESS && result != .SUBOPTIMAL_KHR {
+	// 	log.error("Failed to acquire swapchain image!")
+	// 	return
+	// }
+	if result == .ERROR_OUT_OF_DATE_KHR || result == .SUBOPTIMAL_KHR {
+		return
+	} else if result != .SUCCESS {
+		log.error("Failed to acquire swapchain image!")
+		return
+	}
+
+
+	// Reset the Fence
+	// Only reset AFTER sure submitting work, otherwise might deadlock.
+	vk.ResetFences(device, 1, &sync.in_flight_fences[current_frame^])
+
+	// record the command buffers
+	vk.ResetCommandBuffer(command_buffers[current_frame^], {})
+
+	record_command_buffer(
+		command_buffers[current_frame^],
+		image_index,
+		render_pass,
+		framebuffers,
+		swapchain.extent,
+	)
+
+	// Submit command buffer
+	submit_info := vk.SubmitInfo {
+		sType = .SUBMIT_INFO,
+	}
+
+	// Wait for the image to be available before writing colors
+	wait_semaphores := []vk.Semaphore{sync.image_available_semaphores[current_frame^]}
+	wait_stages := []vk.PipelineStageFlags{{.COLOR_ATTACHMENT_OUTPUT}}
+	submit_info.waitSemaphoreCount = 1
+	submit_info.pWaitSemaphores = raw_data(wait_semaphores)
+	submit_info.pWaitDstStageMask = raw_data(wait_stages)
+
+	// Which buffer to execute
+	cmd_bufs := []vk.CommandBuffer{command_buffers[current_frame^]}
+	submit_info.commandBufferCount = 1
+	submit_info.pCommandBuffers = raw_data(cmd_bufs)
+
+	// Signal this semaphore when drawing is done
+	signal_semaphores := []vk.Semaphore{sync.render_finished_semaphores[current_frame^]}
+	submit_info.signalSemaphoreCount = 1
+	submit_info.pSignalSemaphores = raw_data(signal_semaphores)
+
+	// Submit! (And signal the Fence when the GPU is totally done)
+	if vk.QueueSubmit(graphics_queue, 1, &submit_info, sync.in_flight_fences[current_frame^]) !=
+	   .SUCCESS {
+		log.error("Failed to submit draw command buffer!")
+		return
+	}
+
+	// Present the image to the screen
+	present_info := vk.PresentInfoKHR {
+		sType              = .PRESENT_INFO_KHR,
+		waitSemaphoreCount = 1,
+		pWaitSemaphores    = raw_data(signal_semaphores), // Wait for drawing to finish
+		swapchainCount     = 1,
+		pSwapchains        = &swapchain.handle,
+		pImageIndices      = &image_index,
+	}
+
+	vk.QueuePresentKHR(present_queue, &present_info)
+
+	// Advance to the next frame (0 -> 1 -> 0 -> 1...)
+	current_frame^ = (current_frame^ + 1) % MAX_FRAMES_IN_FLIGHT
+}
