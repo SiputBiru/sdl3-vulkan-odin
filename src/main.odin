@@ -92,19 +92,18 @@ main :: proc() {
 		apiVersion         = vk.API_VERSION_1_3,
 	}
 
-	// --- CRITICAL FIXES HERE ---
 	create_info := vk.InstanceCreateInfo {
 		sType                   = .INSTANCE_CREATE_INFO,
 		pApplicationInfo        = &app_info,
 
-		// 1. Link the Debug Info so we catch creation errors
+		// Link the Debug Info so we catch creation errors
 		pNext                   = &debug_create_info,
 
-		// 2. Use 'all_extensions', not the raw SDL pointer
+		// Use 'all_extensions', not the raw SDL pointer
 		enabledExtensionCount   = u32(len(all_extensions)),
 		ppEnabledExtensionNames = raw_data(all_extensions),
 
-		// 3. Enable the Validation Layers
+		// Enable the Validation Layers
 		enabledLayerCount       = u32(len(VALIDATION_LAYERS)),
 		ppEnabledLayerNames     = raw_data(VALIDATION_LAYERS),
 	}
